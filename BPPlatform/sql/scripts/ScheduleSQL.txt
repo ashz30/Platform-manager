@@ -1,0 +1,282 @@
+
+BEGIN
+
+DECLARE @Window INT = 120, --Numbers of window min from now
+@IsOnlyUpcomingSchedule BIT = 1
+
+
+--SELECT top 10 getUTCdate(),* FROM BPAschedulelogentry order by entrytime desc
+
+
+SET NOCOUNT ON;
+
+if object_id('tempdb..#UpcomingSchedule') is not null drop table #UpcomingSchedule
+if object_id('tempdb..#ScheduleCalendar') is not null drop table #ScheduleCalendar
+if object_id('tempdb..#BPAScheduleLogEntry') is not null drop table #BPAScheduleLogEntry
+if object_id('tempdb..#Resources') is not null drop table #Resources
+if object_id('tempdb..#Windows') is not null drop table #Windows
+
+;WITH Schedule AS
+(SELECT CASE WHEN BPAST.UnitType = 6 THEN DATEADD(MI,DATEDIFF(MI,bpast.startdate,GETUTCDATE()) - (DATEDIFF(MI,bpast.startdate,GETUTCDATE())% BPAST.period) + BPAST.period,dateadd(ss,startpoint,bpast.startdate)) --minutely
+WHEN BPAST.UnitType = 1 THEN DATEADD(HH,DATEDIFF(HH,bpast.startdate,GETUTCDATE()) - (DATEDIFF(HH,bpast.startdate,GETUTCDATE())% BPAST.period) + BPAST.period,bpast.startdate)  --hourly
+WHEN BPAST.UnitType = 2 THEN DATEADD(DD,DATEDIFF(DD,bpast.startdate,GETUTCDATE()) - (DATEDIFF(DD,bpast.startdate,GETUTCDATE())% BPAST.period) + BPAST.period,bpast.startdate) --daily
+WHEN BPAST.UnitType = 3 AND BPAST.nthofmonth = 0  THEN BPAST.startdate --DATEADD(WEEK,BPAST.Period, BPAST.startdate) --weekly
+WHEN BPAST.UnitType = 3 AND BPAST.nthofmonth > 0  THEN DATEADD(WEEK, DATEDIFF(WEEK, 0,BPAST.startdate),0)--DATEADD(WEEK, DATEDIFF(WEEK, 0, DATEADD(WEEK,BPAST.Period, BPAST.startdate)),0) --weekly on first working day
+WHEN BPAST.UnitType = 3 AND BPAST.nthofmonth < 0  THEN DATEADD(WEEK, DATEDIFF(WEEK, 0, BPAST.startdate),4) --DATEADD(WEEK, DATEDIFF(WEEK, 0, DATEADD(WEEK,BPAST.Period, BPAST.startdate)),6) --weekly on last working day
+WHEN BPAST.UnitType = 4 AND BPAST.nthofmonth = 0  THEN BPAST.startdate--DATEADD(MONTH,BPAST.Period, BPAST.startdate) --monthly on xth working day
+WHEN BPAST.UnitType = 4 AND BPAST.nthofmonth > 0 AND BPAST.dayset = 0 THEN
+
+(CASE
+WHEN DATEPART(WEEKDAY, dateadd(mm, DATEDIFF(MM, 0, BPAST.startdate), 0)) = 7
+THEN dateadd(mm, DATEDIFF(MM, 0, BPAST.startdate), 0) + 2
+WHEN DATEPART(WEEKDAY, dateadd(mm, DATEDIFF(MM, 0, BPAST.startdate), 0)) = 0
+THEN dateadd(mm, DATEDIFF(MM, 0, BPAST.startdate), 0) + 1
+ELSE dateadd(mm, DATEDIFF(MM, 0, BPAST.startdate), 0) END)
+
+--DATEADD(DD, 0, DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) + BPAST.period ,0))  --monthly on first working day
+WHEN BPAST.UnitType = 4 AND BPAST.nthofmonth < 0 AND BPAST.dayset = 0 THEN --CONVERT(DATETIME,EOMONTH(BPAST.startdate))  --monthly on last working day
+
+(CASE
+WHEN DATEPART(WEEKDAY, EOMONTH(BPAST.startdate)) = 7
+THEN DATEADD(DD,-1, EOMONTH(BPAST.startdate))
+WHEN DATEPART(WEEKDAY, EOMONTH(BPAST.startdate)) = 0
+THEN DATEADD(DD,-2, EOMONTH(BPAST.startdate))
+ELSE EOMONTH(BPAST.startdate) END)
+
+WHEN BPAST.UnitType = 4 AND BPAST.nthofmonth > 0 AND BPAST.dayset <> 0  THEN  --monthly on xth named weekday
+DATEADD(WEEK,BPAST.nthofmonth -1,
+CASE
+WHEN LOG(NULLIF(BPAST.dayset,0),2) + 1 =  DATEPART(WEEKDAY,DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) ,0)) THEN   DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) ,0)
+WHEN  LOG(NULLIF(BPAST.dayset,0),2) + 1 >   DATEPART(WEEKDAY,DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,BPAST.Period, BPAST.startdate)) ,0)) THEN
+DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) ,0) + LOG(NULLIF(BPAST.dayset,0),2) +1 - DATEPART(WEEKDAY, DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) ,0))
+ELSE DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) ,0) + 7   + DATEDIFF(DD,  DATEPART(WEEKDAY,DATEADD(MM, DATEDIFF(MM, 0, BPAST.startdate) ,0)),LOG(NULLIF(BPAST.dayset,0),2) + 1) END
+)
+WHEN BPAST.UnitType = 4 AND BPAST.nthofmonth < 0 AND BPAST.dayset <> 0  THEN  --monthly on last named weekday
+
+CASE
+WHEN LOG(NULLIF(dayset,0),2) + 1 =  DATEPART(WEEKDAY,EOMONTH( BPAST.startdate)) THEN  EOMONTH( BPAST.startdate)
+WHEN  LOG(NULLIF(dayset,0),2) + 1 >  DATEPART(WEEKDAY,EOMONTH( BPAST.startdate)) THEN
+CONVERT(DATETIME,EOMONTH( BPAST.startdate)) - 7 + DATEDIFF(DD, DATEPART(WEEKDAY,EOMONTH( BPAST.startdate)),LOG(NULLIF(dayset,0),2) + 1)
+ELSE CONVERT(DATETIME,EOMONTH( BPAST.startdate))  + DATEDIFF(DD, DATEPART(WEEKDAY,EOMONTH( BPAST.startdate)),LOG(NULLIF(dayset,0),2) + 1) END
+
+WHEN BPAST.UnitType = 5 THEN DATEADD(YY,BPAST.Period,BPAST.startdate) END 'ScheduleWindow' --yearly
+,BPAST.CalendarId,BPAST.period,BPAST.startpoint,BPAST.endpoint,BPAST.unittype,BPAST.scheduleid,BPAST.id ScheduleTriggerId, BPAST.dayset, BPAST.nthofmonth,BPAST.enddate
+FROM BPAScheduleTrigger BPAST WITH(NOLOCK) --ON LR.scheduleid = BPAST.scheduleid
+WHERE BPAST.UserTrigger = 1)
+
+, ScheduleCalendar AS
+(SELECT * FROM Schedule
+UNION ALL
+SELECT CASE WHEN SC.UnitType = 6 THEN DATEADD(MI,SC.period,dateadd(ss,Sc.startpoint,SC.ScheduleWindow)) --minutely
+WHEN SC.UnitType = 1 THEN DATEADD(HH,SC.Period, SC.ScheduleWindow) --hourly
+WHEN SC.UnitType = 2 THEN DATEADD(DD,SC.Period, SC.ScheduleWindow) --daily
+WHEN SC.UnitType = 3 THEN DATEADD(WEEK,SC.Period, SC.ScheduleWindow) --weekly
+WHEN SC.UnitType = 4 AND SC.nthofmonth = 0 THEN DATEADD(MONTH,SC.Period, SC.ScheduleWindow) --monthly
+WHEN SC.UnitType = 4 AND SC.nthofmonth > 0 AND SC.dayset = 0 THEN  --monthly on first working day of calendar
+
+(CASE
+WHEN DATEPART(WEEKDAY, DATEADD(MONTH,SC.Period, DATEADD(mm, DATEDIFF(MM, 0, SC.ScheduleWindow), 0) )) = 7
+THEN DATEADD(MONTH,SC.Period,  DATEADD(mm, DATEDIFF(MM, 0, SC.ScheduleWindow), 0)) + 2
+WHEN DATEPART(WEEKDAY, DATEADD(MONTH,SC.Period,  DATEADD(mm, DATEDIFF(MM, 0, SC.ScheduleWindow), 0))) = 1
+THEN DATEADD(MONTH,SC.Period,  DATEADD(mm, DATEDIFF(MM, 0, SC.ScheduleWindow), 0)) + 1
+ELSE DATEADD(MONTH,SC.Period,  DATEADD(mm, DATEDIFF(MM, 0, SC.ScheduleWindow), 0)) END)
+
+
+WHEN SC.UnitType = 4 AND SC.nthofmonth < 0 AND SC.dayset = 0 THEN --monthly on last working day of calendar
+
+(CASE
+WHEN DATEPART(WEEKDAY,EOMONTH(DATEADD(MM, SC.period, SC.ScheduleWindow))) = 7
+THEN DATEADD(DD, -1, EOMONTH(DATEADD(MM, SC.period, SC.ScheduleWindow)))
+WHEN DATEPART(WEEKDAY, EOMONTH(DATEADD(MM, SC.period,  SC.ScheduleWindow))) = 1
+THEN DATEADD(DD, -2, EOMONTH(DATEADD(MM, SC.period, SC.ScheduleWindow)))
+ELSE EOMONTH(DATEADD(MM, SC.period, SC.ScheduleWindow)) END)
+
+
+WHEN SC.UnitType = 4 AND SC.nthofmonth > 0 AND SC.dayset <> 0 THEN
+DATEADD(WEEK,SC.nthofmonth -1,
+CASE
+WHEN LOG(NULLIF(SC.dayset,0),2) + 1 =  DATEPART(WEEKDAY,DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0)) THEN   DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0)
+WHEN  LOG(NULLIF(SC.dayset,0),2) + 1 >   DATEPART(WEEKDAY,DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0)) THEN
+DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0) + LOG(NULLIF(SC.dayset,0),2) +1 - DATEPART(WEEKDAY, DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0))
+ELSE DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0) + 7   + DATEDIFF(DD,  DATEPART(WEEKDAY,DATEADD(MM, DATEDIFF(MM, 0, DATEADD(MONTH,SC.Period, SC.ScheduleWindow)) ,0)),LOG(NULLIF(SC.dayset,0),2) + 1) END
+)
+
+WHEN SC.UnitType = 4 AND SC.nthofmonth < 0 AND SC.dayset <> 0 THEN
+CASE
+WHEN LOG(NULLIF(SC.dayset,0),2) + 1 =  DATEPART(WEEKDAY,EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow))) THEN  EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow))
+WHEN  LOG(NULLIF(SC.dayset,0),2) + 1 >  DATEPART(WEEKDAY,EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow))) THEN
+CONVERT(DATETIME,EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow))) - 7 + DATEDIFF(DD, DATEPART(WEEKDAY,EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow))),LOG(NULLIF(SC.dayset,0),2) + 1)
+ELSE CONVERT(DATETIME,EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow)))  + DATEDIFF(DD, DATEPART(WEEKDAY,EOMONTH( DATEADD(MONTH,SC.Period, SC.ScheduleWindow))),LOG(NULLIF(SC.dayset,0),2) + 1) END
+
+
+WHEN SC.UnitType = 5 THEN DATEADD(YY,SC.Period,SC.ScheduleWindow) END 'ScheduleWindow'
+, SC.CalendarId,SC.period,SC.startpoint,SC.endpoint,SC.unittype,SC.scheduleid,SC.ScheduleTriggerId, SC.dayset, SC.nthofmonth,SC.enddate
+ FROM ScheduleCalendar  SC
+INNER JOIN Schedule S ON S.ScheduleTriggerId = SC.ScheduleTriggerId
+AND S.scheduleid = SC.scheduleid
+AND SC.ScheduleWindow <= DATEADD(MI,@Window,GETUTCDATE())
+AND SC.ScheduleWindow <  DATEADD(MI,@Window,ISNULL(SC.enddate,GETUTCDATE()))
+--AND SC.ScheduleWindow <= CASE WHEN @Window < 24 THEN DATEADD(HH,@Window,GETDATE()) ELSE GETDATE() + (@Window/24) END
+--AND SC.ScheduleWindow < CASE WHEN @Window < 24 THEN DATEADD(HH,@Window,ISNULL(SC.enddate,GETDATE())) ELSE ISNULL(SC.enddate,GETDATE() + (@Window/24)) END
+)
+
+
+
+SELECT   * INTO #ScheduleCalendar FROM ScheduleCalendar
+WHERE
+( unittype = 6 AND DATEDIFF(SS,CONVERT(DATETIME,CONVERT(VARCHAR(12), ScheduleWindow,101)),ScheduleWindow) BETWEEN startpoint AND endpoint)
+OR (unittype IN (1,2,3,4,5))
+--OR ScheduleWindow = '2019-05-31 00:00:00.000'
+OPTION (MAXRECURSION 32767)
+
+
+
+
+
+SELECT ROW_NUMBER() OVER(PARTITION BY schedulelogid ORDER BY entrytime asc) rowNum,
+COUNT(*) OVER(PARTITION BY schedulelogid) lastRow, schedulelogid,TaskId,
+TerminationReason 'termination_reason',BPASLE.entrytype 'entry_type',
+CASE WHEN BPASLE.entrytype = 0 THEN 'ScheduleStarted'
+WHEN BPASLE.entrytype = 1 THEN  'ScheduleCompleted'
+WHEN BPASLE.entrytype = 2 THEN  'ScheduleTerminated'
+WHEN BPASLE.entrytype = 3 THEN  'TaskStarted'
+WHEN BPASLE.entrytype = 4 THEN  'TaskCompleted'
+WHEN BPASLE.entrytype = 5 THEN  'TaskTerminated'
+WHEN BPASLE.entrytype = 6 THEN  'SessionStarted'
+WHEN BPASLE.entrytype = 7 THEN  'SessionCompleted'
+WHEN BPASLE.entrytype = 8 THEN  'SessionTerminated'
+WHEN BPASLE.entrytype = 9 THEN  'SessionFailedToStart' END 'entry_type_description', BPASLE.entrytime 'entry_time'
+INTO #BPAScheduleLogEntry FROM BPAScheduleLogEntry   BPASLE WITH(NOLOCK)
+WHERE BPASLE.entrytime > DATEADD(MI,-@Window,GETUTCDATE())
+
+
+--END
+
+
+;WITH CTEWW AS
+(
+SELECT BP.id, BP.name, BP.description, BP.publicholidaygroupid, convert(bigint,BP.workingweek) workingweek, 1 WeekDayNum,
+DATENAME(WEEKDAY,-1) WeekdayName,Cast( (convert(bigint,(convert(bigint,workingweek)/power(cast(2 as bigint),0))) % 2)  as char(1)) IsWorking
+FROM BPACalendar BP WITH(NOLOCK)
+UNION ALL
+SELECT C.id, c.name,c.description,c.publicholidaygroupid,c.workingweek,c.WeekDayNum+1,
+DATENAME(WEEKDAY,-1 + C.WeekDayNum) WeekdayName,Cast( (convert(bigint,(convert(bigint,C.workingweek)/power(cast(2 as bigint), convert(bigint,C.WeekDayNum)))) % 2)  as char(1)) IsWorking
+FROM CTEWW C
+INNER JOIN BPACalendar B WITH(NOLOCK) ON B.id = C.id
+AND convert(bigint,C.WeekDayNum)<7
+),CTETask
+AS
+(
+SELECT BPAS.id ScheduleId, BPAT.id TaskId,BPAT.onsuccess, 1 SeqNo  FROM BPASchedule BPAS  WITH(NOLOCK)
+INNER JOIN BPATask BPAT WITH(NOLOCK) ON BPAT.scheduleid = BPAS.id  AND BPAS.initialtaskid = BPAT.id --aND BPAT.scheduleid = 228
+UNION ALL
+SELECT BPAT.scheduleid,BPAT.id,BPAT.onsuccess, CT.SeqNo + 1 FROM BPATask BPAT
+INNER JOIN CTETask CT ON CT.ScheduleId = BPAT.scheduleid AND BPAT.id = CT.onsuccess AND CT.SeqNo<=30000
+)
+
+
+
+
+SELECT ROW_NUMBER() OVER (PARTITION BY SC.ScheduleTriggerId ORDER BY SC.ScheduleWindow, CT.SeqNo ) RunNumber,
+CASE WHEN SC.UnitType = 6 THEN 'Minutely' --minutely
+WHEN SC.UnitType = 1 THEN 'Hourly' --hourly
+WHEN SC.UnitType = 2 THEN 'Daily' --daily
+WHEN SC.UnitType = 3 THEN 'Weekly' --weekly
+WHEN SC.UnitType = 4 THEN 'Monthly' --monthly
+WHEN SC.UnitType = 5 THEN 'Yearly' --yearly
+END'ScheduleType', BPAS.id ScheduleId, BPAS.name ScheduleName,BPAT.id TaskId,BPATS.id TaskSessionId,BPAT.name TaskName, BPAP.name ProcessName,
+BPAP.description ProcessDescription,BPAC.name Calendar,ScheduleWindow, BPAR.name ResourceName
+INTO #UpcomingSchedule
+FROM #ScheduleCalendar SC
+LEFT JOIN  CTEWW C ON SC.calendarid = C.id
+INNER JOIN BPASchedule BPAS WITH(NOLOCK) ON BPAS.id = SC.scheduleid AND BPAS.retired = 0
+INNER JOIN BPATask BPAT WITH(NOLOCK) ON BPAT.scheduleid = BPAS.id
+INNER JOIN CTETask CT ON CT.ScheduleId = BPAT.scheduleid AND BPAT.id = CT.TaskId AND CT.SeqNo <=30000
+INNER JOIN BPATaskSession BPATS WITH(NOLOCK) ON BPATS.taskid = BPAT.id
+INNER JOIN BPAResource BPAR WITH(NOLOCK) ON BPAR.name = BPATS.resourcename
+INNER JOIN BPAProcess BPAP WITH(NOLOCK) ON BPAP.processid = BPATS.processid
+LEFT JOIN BPACalendar BPAC WITH(NOLOCK) ON BPAC.id = SC.calendarid
+WHERE DATEPART(WEEKDAY,ScheduleWindow) =  CASE WHEN C.id IS NOT NULL THEN WeekDayNum ELSE DATEPART(WEEKDAY,ScheduleWindow) END
+AND
+(
+                (ScheduleWindow BETWEEN GETUTCDATE() AND DATEADD(MI,@Window,GETUTCDATE()) AND @IsOnlyUpcomingSchedule= 1 )
+                OR
+                (SC.scheduleid IN
+                                (
+                                SELECT DISTINCT ScheduleId FROM BPAScheduleLog BL
+                                INNER JOIN #BPAScheduleLogEntry BS ON BS.schedulelogid = BL.id
+                                )
+                 AND @IsOnlyUpcomingSchedule= 0)
+)
+ORDER BY ScheduleWindow
+OPTION (MAXRECURSION 32767)
+
+
+
+
+
+IF (@IsOnlyUpcomingSchedule = 0)
+BEGIN
+
+
+
+SELECT BPASLE.schedulelogid,U.ScheduleType,U.ScheduleId,U.ScheduleName,U.TaskId,U.TaskSessionId,U.TaskName,U.ProcessName,
+U.ProcessDescription,U.Calendar, BPASL.instancetime ScheduleWindow,U.ResourceName,U.LostTime,
+BPASLE.termination_reason,BPASLE.entry_type, BPASLE.entry_type_description, BPASLE.entry_time, BPASL.servername,LU.entry_time last_entry_time, LU.entry_type_description last_entry_status
+
+FROM
+(SELECT DISTINCT Null ListNo, NULL EarliestETAOrder,NULL RunNumber, ScheduleType, ScheduleId, ScheduleName, TaskId,TaskSessionId,TaskName,ProcessName,
+ProcessDescription,Calendar,ResourceName,NULL LostTime
+FROM #UpcomingSchedule) U
+INNER JOIN BPAScheduleLog BPASL WITH(NOLOCK) ON BPASL.ScheduleId = U.ScheduleId
+INNER JOIN #BPAScheduleLogEntry BPASLE WITH(NOLOCK)  ON BPASL.id = BPASLE.schedulelogid
+AND BPASLE.TaskId = U.TaskId --AND BPASLE.entry_time > GETDATE() - 5 -- DATEADD(HH,-@Window,GETUTCDATE())
+AND BPASLE.entry_type NOT IN(0,1,2)
+INNER JOIN (SELECT schedulelogid,entry_time,entry_type_description FROM #BPAScheduleLogEntry WHERE rowNum = lastRow) LU ON LU.schedulelogid = BPASL.id
+ORDER BY ScheduleId, TaskId, TaskSessionId,last_entry_time
+--UNION ALL
+--SELECT Null ListNo, NULL EarliestETAOrder,*,NULL LostTime,NULL termination_reason, NULL entry_type, NULL entry_type_description, NULL entry_time,
+--NULL server_name,NULL last_entry_time,NULL last_entry_status  FROM #UpcomingSchedule
+--ORDER BY ScheduleId, TaskId, TaskSessionId,entry_type
+
+
+
+RETURN
+END
+
+
+SELECT MIN(ScheduleWindow), ResourceName FROM #UpcomingSchedule group by ResourceName
+return
+SELECT ROW_NUMBER() OVER (ORDER BY ResourceName) rowNum,ResourceName INTO #Resources  FROM
+(SELECT DISTINCT ResourceName FROM #UpcomingSchedule) A
+
+
+SELECT DISTINCT ScheduleWindow INTO #Windows FROM #UpcomingSchedule
+
+DECLARE @Min INT, @Max INT
+SELECT @Min = MIN(rowNum), @Max = MAX(rowNum) FROM #Resources
+DECLARE @ColName nvarchar(100)
+DECLARE @DynamicSQL nvarchar(250)
+
+WHILE @Min<= @Max
+BEGIN
+
+SET @ColName= (SELECT ResourceName FROM #Resources WHERE rowNum = @Min)
+SET @DynamicSQL = 'ALTER TABLE #Windows ADD ['+ CAST(@ColName AS NVARCHAR(100)) +'] NVARCHAR(100) NULL'
+
+EXEC(@DynamicSQL)
+
+SET @DynamicSQL =  'UPDATE  W
+SET W.['+ CAST(@ColName AS NVARCHAR(100)) +'] =  (SELECT COUNT(DISTINCT ScheduleName) FROM #UpcomingSchedule U WHERE W.ScheduleWindow BETWEEN U.ScheduleWindow
+AND ETA AND U.ResourceName = '''+ @ColName+''')
+FROM #Windows W'
+
+
+
+EXEC(@DynamicSQL)
+
+SET @Min += 1
+END
+
+SELECT * FROM  #Windows   ORDER BY 1 ASC
+END
